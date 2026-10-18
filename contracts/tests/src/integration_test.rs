@@ -1200,6 +1200,71 @@ mod tests {
         );
     }
 
+    /// An executed governance proposal cannot be cancelled while its queued
+    /// credit-oracle weights are waiting for the oracle timelock.
+    #[test]
+    fn test_cancel_executed_proposal_preserves_pending_oracle_weights() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register_contract(None, CreditOracle);
+        let gov_id = env.register_contract(None, Governance);
+
+        let credit = CreditOracleClient::new(&env, &credit_id);
+        let gov = GovernanceClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+        credit.initialize(&admin);
+        gov.initialize(&admin, &credit_id, &100);
+
+        credit.propose_new_admin(&gov_id);
+        gov.accept_oracle_admin();
+
+        let proposed_weights = ScoringWeights {
+            vc_weight: 50,
+            tx_weight: 20,
+            repayment_weight: 30,
+        };
+        let proposer = Address::generate(&env);
+        let proposal_id = gov.create_proposal(&proposer, &proposed_weights, &100, &0);
+
+        let voter = Address::generate(&env);
+        gov.register_voter(&admin, &voter, &200);
+        gov.vote(&voter, &proposal_id, &true, &200);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 101;
+        });
+        gov.execute(&proposal_id);
+
+        let cancel_result = gov.try_cancel_proposal(&proposer, &proposal_id);
+        assert_eq!(
+            cancel_result,
+            Err(Ok(GovernanceError::ProposalAlreadyExecuted))
+        );
+
+        let proposal = gov.get_proposal(&proposal_id).unwrap();
+        assert!(proposal.executed);
+        assert!(!proposal.cancelled);
+
+        let active_weights = credit.get_scoring_weights();
+        assert_eq!(active_weights.vc_weight, 40);
+        assert_eq!(active_weights.tx_weight, 30);
+        assert_eq!(active_weights.repayment_weight, 30);
+
+        let pending = credit.get_pending_weights().unwrap();
+        assert_eq!(pending.weights.vc_weight, proposed_weights.vc_weight);
+        assert_eq!(pending.weights.tx_weight, proposed_weights.tx_weight);
+        assert_eq!(
+            pending.weights.repayment_weight,
+            proposed_weights.repayment_weight
+        );
+        assert!(
+            pending.effective_ledger > env.ledger().sequence(),
+            "the oracle timelock must not have expired"
+        );
+    }
+
     /// Integration test for governance execution timelock:
     /// vote passes  advance past voting  execution rejected (timelock) 
     /// advance past delay  execution succeeds.
